@@ -13,33 +13,30 @@ import (
 )
 
 type RegistrationManager struct {
-	config *SIPRegistration
-	client *sipgo.Client
-	dialog *sipgo.DialogClientSession
-	cancel context.CancelFunc
+	config  *SIPRegistration
+	client  *sipgo.Client
+	dialog  *sipgo.DialogClientSession
+	cancel  context.CancelFunc
+	localIP string
 }
 
 // NewRegistrationManager creates a new SIP registration manager
-func NewRegistrationManager(config *SIPRegistration) (*RegistrationManager, error) {
+func NewRegistrationManager(config *SIPRegistration, ua *sipgo.UserAgent, localIP string) (*RegistrationManager, error) {
 	if !config.Enabled {
 		return nil, nil
 	}
 
-	ua, err := sipgo.NewUA(
-		sipgo.WithUserAgent("SIP2RTSP/1.0"),
+	client, err := sipgo.NewClient(
+		ua,
 	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create user agent: %w", err)
-	}
-
-	client, err := sipgo.NewClient(ua)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create SIP client: %w", err)
 	}
 
 	return &RegistrationManager{
-		config: config,
-		client: client,
+		config:  config,
+		client:  client,
+		localIP: localIP,
 	}, nil
 }
 
@@ -93,8 +90,8 @@ func (rm *RegistrationManager) register(ctx context.Context) error {
 		Int("expires", rm.config.Expires).
 		Msg("Registering with SIP server")
 
+	// Request-URI should be domain only (no username) for REGISTER
 	recipient := &sip.Uri{
-		User: rm.config.Username,
 		Host: rm.config.Server,
 	}
 
@@ -103,11 +100,16 @@ func (rm *RegistrationManager) register(ctx context.Context) error {
 		Host: rm.config.Server,
 	}
 
+	contact := &sip.Uri{
+		User: rm.config.Username,
+		Host: rm.localIP,
+	}
+
 	req := sip.NewRequest(sip.REGISTER, recipient)
 	req.SetDestination(rm.config.Server)
 	req.AppendHeader(sip.NewHeader("From", fmt.Sprintf("<%s>;tag=%d", from.String(), time.Now().Unix())))
 	req.AppendHeader(sip.NewHeader("To", fmt.Sprintf("<%s>", from.String())))
-	req.AppendHeader(sip.NewHeader("Contact", fmt.Sprintf("<%s>", from.String())))
+	req.AppendHeader(sip.NewHeader("Contact", fmt.Sprintf("<%s>", contact.String())))
 	req.AppendHeader(sip.NewHeader("Expires", fmt.Sprintf("%d", rm.config.Expires)))
 
 	cseq := sip.CSeqHeader{
@@ -171,33 +173,109 @@ func (rm *RegistrationManager) registerWithAuth(ctx context.Context, originalReq
 	// Parse authentication parameters
 	authParams := parseAuthHeader(authHeader.Value())
 
+	log.Debug().
+		Str("realm", authParams["realm"]).
+		Str("nonce", authParams["nonce"]).
+		Str("algorithm", authParams["algorithm"]).
+		Str("qop", authParams["qop"]).
+		Msg("Authentication challenge parameters")
+
+	// Use domain-only URI (without username) for REGISTER
+	uri := fmt.Sprintf("sip:%s", rm.config.Server)
+
 	// Calculate response
-	auth := calculateDigestResponse(
+	auth, cnonce, nc := calculateDigestResponse(
 		rm.config.Username,
 		rm.config.Password,
 		originalReq.Method.String(),
-		originalReq.Recipient.String(),
+		uri,
 		authParams,
 	)
 
-	// Create new request with Authorization header
-	req := originalReq.Clone()
+	log.Debug().
+		Str("uri", uri).
+		Str("username", rm.config.Username).
+		Str("method", originalReq.Method.String()).
+		Str("response", auth).
+		Str("cnonce", cnonce).
+		Str("nc", nc).
+		Msg("Digest authentication calculated")
 
-	// Update CSeq
-	if cseq := req.CSeq(); cseq != nil {
-		cseq.SeqNo++
+	// Create a fresh request (not cloned) to get a new transaction ID
+	// Request-URI should be domain only (no username) for REGISTER
+	recipient := &sip.Uri{
+		Host: rm.config.Server,
+	}
+
+	contact := &sip.Uri{
+		User: rm.config.Username,
+		Host: rm.localIP,
+	}
+
+	req := sip.NewRequest(sip.REGISTER, recipient)
+	req.SetDestination(rm.config.Server)
+
+	// Copy necessary headers from original request
+	if fromHdr := originalReq.GetHeader("From"); fromHdr != nil {
+		req.AppendHeader(sip.NewHeader("From", fromHdr.Value()))
+	}
+	if toHdr := originalReq.GetHeader("To"); toHdr != nil {
+		req.AppendHeader(sip.NewHeader("To", toHdr.Value()))
+	}
+	// Use local IP for Contact header
+	req.AppendHeader(sip.NewHeader("Contact", fmt.Sprintf("<%s>", contact.String())))
+	if expiresHdr := originalReq.GetHeader("Expires"); expiresHdr != nil {
+		req.AppendHeader(sip.NewHeader("Expires", expiresHdr.Value()))
+	}
+
+	// Increment CSeq for the new request
+	cseq := sip.CSeqHeader{
+		SeqNo:      2,
+		MethodName: sip.REGISTER,
+	}
+	req.AppendHeader(&cseq)
+
+	// Use the same Call-ID as the original request
+	if callIDHdr := originalReq.CallID(); callIDHdr != nil {
+		req.AppendHeader(callIDHdr)
 	}
 
 	// Add Authorization header
-	authHeaderValue := fmt.Sprintf(
-		`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s", algorithm=MD5`,
-		rm.config.Username,
-		authParams["realm"],
-		authParams["nonce"],
-		originalReq.Recipient.String(),
-		auth,
-	)
+	var authHeaderValue string
+	if authParams["qop"] == "auth" || authParams["qop"] == "auth-int" {
+		authHeaderValue = fmt.Sprintf(
+			`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s", algorithm=MD5, qop=%s, nc=%s, cnonce="%s"`,
+			rm.config.Username,
+			authParams["realm"],
+			authParams["nonce"],
+			uri,
+			auth,
+			authParams["qop"],
+			nc,
+			cnonce,
+		)
+	} else {
+		authHeaderValue = fmt.Sprintf(
+			`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s", algorithm=MD5`,
+			rm.config.Username,
+			authParams["realm"],
+			authParams["nonce"],
+			uri,
+			auth,
+		)
+	}
 	req.AppendHeader(sip.NewHeader("Authorization", authHeaderValue))
+
+	log.Debug().
+		Str("authorization", authHeaderValue).
+		Msg("Authorization header")
+
+	log.Debug().
+		Str("request_uri", req.Recipient.String()).
+		Str("from", req.From().Value()).
+		Str("to", req.To().Value()).
+		Str("contact", req.Contact().Value()).
+		Msg("Request details")
 
 	// Send authenticated REGISTER
 	tx, err := rm.client.TransactionRequest(ctx, req)
@@ -233,8 +311,8 @@ func (rm *RegistrationManager) registerWithAuth(ctx context.Context, originalReq
 func (rm *RegistrationManager) unregister(ctx context.Context) error {
 	log.Info().Msg("Unregistering from SIP server")
 
+	// Request-URI should be domain only (no username) for REGISTER
 	recipient := &sip.Uri{
-		User: rm.config.Username,
 		Host: rm.config.Server,
 	}
 
@@ -243,11 +321,16 @@ func (rm *RegistrationManager) unregister(ctx context.Context) error {
 		Host: rm.config.Server,
 	}
 
+	contact := &sip.Uri{
+		User: rm.config.Username,
+		Host: rm.localIP,
+	}
+
 	req := sip.NewRequest(sip.REGISTER, recipient)
 	req.SetDestination(rm.config.Server)
 	req.AppendHeader(sip.NewHeader("From", fmt.Sprintf("<%s>;tag=%d", from.String(), time.Now().Unix())))
 	req.AppendHeader(sip.NewHeader("To", fmt.Sprintf("<%s>", from.String())))
-	req.AppendHeader(sip.NewHeader("Contact", fmt.Sprintf("<%s>", from.String())))
+	req.AppendHeader(sip.NewHeader("Contact", fmt.Sprintf("<%s>", contact.String())))
 	req.AppendHeader(sip.NewHeader("Expires", "0")) // Unregister
 
 	cseq := sip.CSeqHeader{
@@ -323,9 +406,10 @@ func parseAuthHeader(header string) map[string]string {
 	return params
 }
 
-func calculateDigestResponse(username, password, method, uri string, params map[string]string) string {
+func calculateDigestResponse(username, password, method, uri string, params map[string]string) (string, string, string) {
 	realm := params["realm"]
 	nonce := params["nonce"]
+	qop := params["qop"]
 
 	// Calculate HA1 = MD5(username:realm:password)
 	ha1 := fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s:%s", username, realm, password))))
@@ -333,8 +417,22 @@ func calculateDigestResponse(username, password, method, uri string, params map[
 	// Calculate HA2 = MD5(method:uri)
 	ha2 := fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s", method, uri))))
 
-	// Calculate response = MD5(HA1:nonce:HA2)
-	response := fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s:%s", ha1, nonce, ha2))))
+	var response string
+	var cnonce string
+	nc := "00000001"
 
-	return response
+	// If qop is specified, use the extended digest calculation
+	if qop == "auth" || qop == "auth-int" {
+		// Generate client nonce
+		cnonce = fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))))
+
+		// Calculate response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
+		response = fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s:%s:%s:%s:%s", ha1, nonce, nc, cnonce, qop, ha2))))
+	} else {
+		// Basic digest auth (no qop)
+		// Calculate response = MD5(HA1:nonce:HA2)
+		response = fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%s:%s:%s", ha1, nonce, ha2))))
+	}
+
+	return response, cnonce, nc
 }

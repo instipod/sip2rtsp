@@ -36,10 +36,11 @@ func (s *CallSession) GetLatestAudioFrame() []byte {
 
 var (
 	appConfig            *AppConfig
-	sessions             = make(map[string]*CallSession)          // indexed by callID
+	sessions             = make(map[string]*CallSession) // indexed by callID
 	sessionsMux          sync.RWMutex
 	rtspServer           *RTSPServer
 	registrationManagers = make(map[string]*RegistrationManager) // indexed by extension number
+	sipUA                *sipgo.UserAgent
 )
 
 func main() {
@@ -100,10 +101,16 @@ func main() {
 			Msg("Initialized RTSP stream")
 	}
 
+	// Start SIP server
+	if err := startSIPServer(); err != nil {
+		log.Fatal().Err(err).Msg("Failed to start SIP server")
+	}
+
 	// Initialize SIP registrations for extensions that have it enabled
 	registeredExts := appConfig.GetRegisteredExtensions()
+	localIP := getLocalIP()
 	for _, ext := range registeredExts {
-		regMgr, err := NewRegistrationManager(ext.SIPRegistration)
+		regMgr, err := NewRegistrationManager(ext.SIPRegistration, sipUA, localIP)
 		if err != nil {
 			log.Fatal().
 				Err(err).
@@ -124,11 +131,6 @@ func main() {
 			Str("server", ext.SIPRegistration.Server).
 			Str("username", ext.SIPRegistration.Username).
 			Msg("SIP registration enabled for extension")
-	}
-
-	// Start SIP server
-	if err := startSIPServer(); err != nil {
-		log.Fatal().Err(err).Msg("Failed to start SIP server")
 	}
 
 	// Wait for interrupt signal
@@ -154,6 +156,7 @@ func startSIPServer() error {
 	}
 
 	srv.OnInvite(handleInvite)
+	srv.OnOptions(handleOptions)
 	srv.OnBye(handleBye)
 
 	addr := fmt.Sprintf("%s:%d", appConfig.SIPListenAddr, appConfig.SIPPort)
@@ -164,6 +167,9 @@ func startSIPServer() error {
 	}()
 
 	log.Info().Str("address", addr).Msg("SIP server listening")
+
+	sipUA = ua
+
 	return nil
 }
 
@@ -265,6 +271,13 @@ func handleBye(req *sip.Request, tx sip.ServerTransaction) {
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 	if err := tx.Respond(res); err != nil {
 		log.Error().Err(err).Msg("Failed to send 200 OK for BYE")
+	}
+}
+
+func handleOptions(req *sip.Request, tx sip.ServerTransaction) {
+	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
+	if err := tx.Respond(res); err != nil {
+		log.Error().Err(err).Msg("Failed to send 200 OK for OPTIONS")
 	}
 }
 
