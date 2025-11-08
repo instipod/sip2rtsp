@@ -23,7 +23,6 @@ type CallSession struct {
 	audioBridge *AudioBridge
 	cancel      context.CancelFunc
 	timeout     *time.Timer
-	mu          sync.Mutex
 }
 
 // GetLatestAudioFrame returns the latest audio frame from this session

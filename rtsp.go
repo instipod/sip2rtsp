@@ -25,11 +25,14 @@ type RTSPServer struct {
 
 // RTSPStream represents a single RTSP stream for an extension
 type RTSPStream struct {
-	extension    string
-	session      *CallSession // nil when no active call
-	stream       *gortsplib.ServerStream
-	cancel       context.CancelFunc
-	sessionMutex sync.RWMutex
+	extension            string
+	session              *CallSession // nil when no active call
+	stream               *gortsplib.ServerStream
+	streamWithBackchan   *gortsplib.ServerStream // Stream with backchannel support
+	cancel               context.CancelFunc
+	sessionMutex         sync.RWMutex
+	backchannelActive    bool // Track if a client is sending backchannel audio
+	backchannelRequested bool // Track if backchannel was requested in DESCRIBE
 }
 
 // NewRTSPServer creates a new RTSP server
@@ -51,7 +54,7 @@ func NewRTSPServer(listenAddr string) (*RTSPServer, error) {
 
 // Start starts the RTSP server
 func (rs *RTSPServer) Start(ctx context.Context) error {
-	ctx, rs.cancel = context.WithCancel(ctx)
+	_, rs.cancel = context.WithCancel(ctx)
 
 	// Start the server
 	go func() {
@@ -65,7 +68,7 @@ func (rs *RTSPServer) Start(ctx context.Context) error {
 
 	log.Info().
 		Str("address", rs.server.RTSPAddress).
-		Msg("RTSP server started - streams will be created per extension (e.g., rtsp://localhost:PORT/100)")
+		Msg("RTSP server started")
 	return nil
 }
 
@@ -82,7 +85,7 @@ func (rs *RTSPServer) AddStaticStream(extension string) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Create stream with PCMU format
+	// Create standard stream with PCMU format
 	pcmuFormat := &format.G711{
 		PayloadTyp:   0,
 		MULaw:        true,
@@ -99,11 +102,40 @@ func (rs *RTSPServer) AddStaticStream(extension string) {
 		},
 	})
 
+	// Create stream with backchannel support (two tracks)
+	pcmuFormatRecv := &format.G711{
+		PayloadTyp:   0,
+		MULaw:        true,
+		SampleRate:   8000,
+		ChannelCount: 1,
+	}
+	pcmuFormatSend := &format.G711{
+		PayloadTyp:   0,
+		MULaw:        true,
+		SampleRate:   8000,
+		ChannelCount: 1,
+	}
+
+	streamWithBackchan := gortsplib.NewServerStream(rs.server, &description.Session{
+		Medias: []*description.Media{
+			{
+				Type:    description.MediaTypeAudio,
+				Formats: []format.Format{pcmuFormatRecv},
+			},
+			{
+				Type:          description.MediaTypeAudio,
+				Formats:       []format.Format{pcmuFormatSend},
+				IsBackChannel: true,
+			},
+		},
+	})
+
 	rtspStream := &RTSPStream{
-		extension: extension,
-		session:   nil, // No session initially
-		stream:    stream,
-		cancel:    cancel,
+		extension:          extension,
+		session:            nil, // No session initially
+		stream:             stream,
+		streamWithBackchan: streamWithBackchan,
+		cancel:             cancel,
 	}
 
 	rs.streams[extension] = rtspStream
@@ -171,6 +203,9 @@ func (rs *RTSPServer) removeStreamLocked(extension string) {
 		}
 		if rtspStream.stream != nil {
 			rtspStream.stream.Close()
+		}
+		if rtspStream.streamWithBackchan != nil {
+			rtspStream.streamWithBackchan.Close()
 		}
 		delete(rs.streams, extension)
 		log.Info().Str("extension", extension).Msg("RTSP stream removed")
@@ -256,9 +291,51 @@ func (rs *RTSPServer) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*ba
 		}, nil, nil
 	}
 
-	return &base.Response{
-		StatusCode: base.StatusOK,
-	}, rtspStream.stream, nil
+	// Check for ONVIF backchannel requirement in headers
+	backchannelRequested := false
+	if ctx.Request != nil {
+		if requireHeader := ctx.Request.Header["Require"]; requireHeader != nil {
+			for _, val := range requireHeader {
+				if strings.Contains(val, "www.onvif.org/ver20/backchannel") {
+					backchannelRequested = true
+					break
+				}
+			}
+		}
+	}
+
+	// Store backchannel request state
+	rtspStream.sessionMutex.Lock()
+	rtspStream.backchannelRequested = backchannelRequested
+	rtspStream.sessionMutex.Unlock()
+
+	// Always return backchannel stream and advertise support
+	if backchannelRequested {
+		log.Info().
+			Str("extension", extension).
+			Bool("explicit_require", backchannelRequested).
+			Msg("Returning 2-way RTSP stream with ONVIF backchannel support")
+
+		response := &base.Response{
+			StatusCode: base.StatusOK,
+			Header: base.Header{
+				"Supported": base.HeaderValue{"www.onvif.org/ver20/backchannel"},
+			},
+		}
+
+		return response, rtspStream.streamWithBackchan, nil
+	} else {
+		log.Info().
+			Str("extension", extension).
+			Bool("explicit_require", backchannelRequested).
+			Msg("Returning 1-way RTSP stream")
+
+		response := &base.Response{
+			StatusCode: base.StatusOK,
+		}
+
+		return response, rtspStream.stream, nil
+	}
 }
 
 // OnSetup implements gortsplib.ServerHandlerOnSetup
@@ -282,9 +359,15 @@ func (rs *RTSPServer) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Res
 		}, nil, fmt.Errorf("stream not found")
 	}
 
-	return &base.Response{
-		StatusCode: base.StatusOK,
-	}, rtspStream.stream, nil
+	if rtspStream.backchannelRequested {
+		return &base.Response{
+			StatusCode: base.StatusOK,
+		}, rtspStream.streamWithBackchan, nil
+	} else {
+		return &base.Response{
+			StatusCode: base.StatusOK,
+		}, rtspStream.stream, nil
+	}
 }
 
 // OnPlay implements gortsplib.ServerHandlerOnPlay
@@ -294,16 +377,34 @@ func (rs *RTSPServer) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respo
 		Str("session", fmt.Sprintf("%p", ctx.Session)).
 		Msg("RTSP PLAY request")
 
+	// Extract extension from path
+	extension := strings.TrimPrefix(ctx.Path, "/")
+
+	rs.mu.RLock()
+	rtspStream, exists := rs.streams[extension]
+	rs.mu.RUnlock()
+
+	if exists && rtspStream.backchannelRequested {
+		// Start backchannel receiver automatically for ONVIF support
+		// The client can immediately start sending audio on the backchannel track
+		rtspStream.sessionMutex.Lock()
+		if !rtspStream.backchannelActive {
+			rtspStream.backchannelActive = true
+			rtspStream.sessionMutex.Unlock()
+
+			log.Info().
+				Str("extension", extension).
+				Msg("Starting ONVIF backchannel receiver (automatic on PLAY)")
+
+			go rs.receiveBackchannel(ctx.Session, rtspStream)
+		} else {
+			rtspStream.sessionMutex.Unlock()
+		}
+	}
+
 	return &base.Response{
 		StatusCode: base.StatusOK,
 	}, nil
-}
-
-// OnRecord implements gortsplib.ServerHandlerOnRecord
-func (rs *RTSPServer) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.Response, error) {
-	return &base.Response{
-		StatusCode: base.StatusNotImplemented,
-	}, fmt.Errorf("recording not supported")
 }
 
 // OnAnnounce implements gortsplib.ServerHandlerOnAnnounce
@@ -336,6 +437,117 @@ func (rs *RTSPServer) OnSetParameter(ctx *gortsplib.ServerHandlerOnSetParameterC
 	return &base.Response{
 		StatusCode: base.StatusOK,
 	}, nil
+}
+
+// receiveBackchannel receives RTP packets from RTSP client and forwards to SIP
+func (rs *RTSPServer) receiveBackchannel(sess *gortsplib.ServerSession, rtspStream *RTSPStream) {
+	// Add nil check for session
+	if sess == nil {
+		log.Error().Str("extension", rtspStream.extension).Msg("Cannot start backchannel receiver: session is nil")
+		return
+	}
+
+	log.Info().
+		Str("extension", rtspStream.extension).
+		Str("session", fmt.Sprintf("%p", sess)).
+		Msg("Starting backchannel receiver")
+
+	// Get the backchannel media (second track in the backchannel stream)
+	if len(rtspStream.streamWithBackchan.Description().Medias) < 2 {
+		log.Error().Str("extension", rtspStream.extension).Msg("No backchannel media available")
+		return
+	}
+
+	backchannelMedia := rtspStream.streamWithBackchan.Description().Medias[1]
+	backchannelFormat := backchannelMedia.Formats[0]
+
+	// Create a channel for receiving packets
+	rtpChan := make(chan *rtp.Packet, 100)
+	stopChan := make(chan struct{})
+
+	// Set up packet reader with defer recovery to handle session close
+	var packetCount uint64
+	defer func() {
+		if r := recover(); r != nil {
+			log.Debug().
+				Str("extension", rtspStream.extension).
+				Interface("panic", r).
+				Msg("Backchannel receiver recovered from panic (likely session closed)")
+		}
+		close(stopChan)
+	}()
+
+	sess.OnPacketRTP(backchannelMedia, backchannelFormat, func(pkt *rtp.Packet) {
+		select {
+		case rtpChan <- pkt:
+			packetCount++
+			if packetCount%50 == 0 {
+				log.Debug().
+					Str("extension", rtspStream.extension).
+					Uint64("packets_received", packetCount).
+					Uint16("seq", pkt.SequenceNumber).
+					Int("payload_size", len(pkt.Payload)).
+					Msg("Backchannel RTP packets received from RTSP client")
+			}
+		default:
+			// Drop packet if channel is full
+			log.Debug().Msg("Backchannel packet buffer full, dropping")
+		}
+	})
+
+	// Process packets with timeout for graceful shutdown
+	var sentCount uint64
+	timeout := time.NewTimer(5 * time.Minute) // Max 5 minutes of inactivity
+	defer timeout.Stop()
+
+	for {
+		select {
+		case <-stopChan:
+			log.Info().
+				Str("extension", rtspStream.extension).
+				Msg("Backchannel receiver stopped")
+			return
+		case <-timeout.C:
+			log.Info().
+				Str("extension", rtspStream.extension).
+				Msg("Backchannel receiver timeout - stopping")
+			return
+		case pkt := <-rtpChan:
+			// Reset timeout on activity
+			if !timeout.Stop() {
+				select {
+				case <-timeout.C:
+				default:
+				}
+			}
+			timeout.Reset(5 * time.Minute)
+
+			// Get the current session
+			rtspStream.sessionMutex.RLock()
+			session := rtspStream.session
+			rtspStream.sessionMutex.RUnlock()
+
+			if session == nil {
+				log.Debug().Msg("No active SIP session for backchannel audio")
+				continue
+			}
+
+			// Send the audio payload to the SIP caller via AudioBridge
+			if session.audioBridge != nil {
+				if err := session.audioBridge.SendToSIP(pkt.Payload); err != nil {
+					log.Debug().Err(err).Msg("Failed to send backchannel audio to SIP")
+				} else {
+					sentCount++
+					if sentCount == 1 {
+						log.Info().
+							Str("extension", rtspStream.extension).
+							Str("call_id", session.callID).
+							Msg("First backchannel packet successfully forwarded to SIP")
+					}
+				}
+			}
+		}
+	}
 }
 
 // streamAudio reads audio from a session and streams it via RTP
@@ -384,10 +596,21 @@ func (rs *RTSPServer) streamAudio(ctx context.Context, rtspStream *RTSPStream) {
 				Payload: audioFrame,
 			}
 
-			// Write packet to stream (only if there are readers)
-			err := rtspStream.stream.WritePacketRTP(rtspStream.stream.Description().Medias[0], packet)
-			if err != nil {
-				log.Debug().Err(err).Str("extension", rtspStream.extension).Msg("Failed to write RTP packet")
+			// Write packet to both streams (standard and backchannel)
+			// Standard stream (single track)
+			if !rtspStream.backchannelRequested {
+				err := rtspStream.stream.WritePacketRTP(rtspStream.stream.Description().Medias[0], packet)
+				if err != nil {
+					log.Debug().Err(err).Str("extension", rtspStream.extension).Msg("Failed to write RTP packet to standard stream")
+				}
+			}
+
+			// Backchannel stream (first track - recvonly from client perspective)
+			if rtspStream.backchannelRequested {
+				err := rtspStream.streamWithBackchan.WritePacketRTP(rtspStream.streamWithBackchan.Description().Medias[0], packet)
+				if err != nil {
+					log.Debug().Err(err).Str("extension", rtspStream.extension).Msg("Failed to write RTP packet to backchannel stream")
+				}
 			}
 
 			sequenceNumber++

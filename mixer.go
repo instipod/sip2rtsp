@@ -174,16 +174,6 @@ func (m *AudioMixer) mixFrame() []byte {
 	return mixedUlaw
 }
 
-// generateSilenceUlaw generates a ulaw silence frame
-func generateSilenceUlaw(size int) []byte {
-	silence := make([]byte, size)
-	// 0xFF is ulaw encoded silence (0 in linear)
-	for i := range silence {
-		silence[i] = 0xFF
-	}
-	return silence
-}
-
 // pcm16ToUlaw encodes a PCM16 sample to ulaw
 func pcm16ToUlaw(pcm int16) byte {
 	// Get sign
