@@ -18,10 +18,11 @@ type RegistrationManager struct {
 	dialog  *sipgo.DialogClientSession
 	cancel  context.CancelFunc
 	localIP string
+	sipPort int
 }
 
 // NewRegistrationManager creates a new SIP registration manager
-func NewRegistrationManager(config *SIPRegistration, ua *sipgo.UserAgent, localIP string) (*RegistrationManager, error) {
+func NewRegistrationManager(config *SIPRegistration, ua *sipgo.UserAgent, localIP string, sipPort int) (*RegistrationManager, error) {
 	if !config.Enabled {
 		return nil, nil
 	}
@@ -37,6 +38,7 @@ func NewRegistrationManager(config *SIPRegistration, ua *sipgo.UserAgent, localI
 		config:  config,
 		client:  client,
 		localIP: localIP,
+		sipPort: sipPort,
 	}, nil
 }
 
@@ -103,6 +105,7 @@ func (rm *RegistrationManager) register(ctx context.Context) error {
 	contact := &sip.Uri{
 		User: rm.config.Username,
 		Host: rm.localIP,
+		Port: rm.sipPort,
 	}
 
 	req := sip.NewRequest(sip.REGISTER, recipient)

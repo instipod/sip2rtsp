@@ -110,7 +110,7 @@ func main() {
 	registeredExts := appConfig.GetRegisteredExtensions()
 	localIP := getLocalIP()
 	for _, ext := range registeredExts {
-		regMgr, err := NewRegistrationManager(ext.SIPRegistration, sipUA, localIP)
+		regMgr, err := NewRegistrationManager(ext.SIPRegistration, sipUA, localIP, appConfig.SIPPort)
 		if err != nil {
 			log.Fatal().
 				Err(err).
@@ -157,6 +157,7 @@ func startSIPServer() error {
 
 	srv.OnInvite(handleInvite)
 	srv.OnOptions(handleOptions)
+	srv.OnAck(handleAck)
 	srv.OnBye(handleBye)
 
 	addr := fmt.Sprintf("%s:%d", appConfig.SIPListenAddr, appConfig.SIPPort)
@@ -180,10 +181,10 @@ func handleInvite(req *sip.Request, tx sip.ServerTransaction) {
 		Str("call_id", req.CallID().Value()).
 		Msg("Received INVITE")
 
-	// Send 100 Trying
-	res := sip.NewResponseFromRequest(req, 100, "Trying", nil)
+	// Send 180 Ringing
+	res := sip.NewResponseFromRequest(req, 180, "Ringing", nil)
 	if err := tx.Respond(res); err != nil {
-		log.Error().Err(err).Msg("Failed to send 100 Trying")
+		log.Error().Err(err).Msg("Failed to send 180 Ringing")
 		return
 	}
 
@@ -281,6 +282,13 @@ func handleOptions(req *sip.Request, tx sip.ServerTransaction) {
 	}
 }
 
+func handleAck(req *sip.Request, tx sip.ServerTransaction) {
+	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
+	if err := tx.Respond(res); err != nil {
+		log.Error().Err(err).Msg("Failed to send 200 OK for OPTIONS")
+	}
+}
+
 func cleanupSession(callID string) {
 	sessionsMux.Lock()
 	defer sessionsMux.Unlock()
@@ -370,7 +378,7 @@ func createSDPAnswer(req *sip.Request, session *CallSession) string {
 
 	sdp := fmt.Sprintf(`v=0
 o=- %d 0 IN IP4 %s
-s=SIP2WebRTC
+s=SIP2RTSP
 c=IN IP4 %s
 t=0 0
 m=audio %d RTP/AVP 0
